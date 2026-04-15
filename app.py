@@ -1,541 +1,512 @@
-
-from flask import Flask, request, jsonify, redirect, Response
 import os
-import json
-import uuid
-from datetime import datetime, timedelta, timezone
-import stripe
+import secrets
+from datetime import datetime, timedelta
+
+from flask import Flask, request, jsonify, redirect, url_for, render_template_string
+from flask_sqlalchemy import SQLAlchemy
 
 app = Flask(__name__)
 
 # =========================
-# CONFIG
+# CONFIGURACION
 # =========================
-LICENSE_FILE = "licenses.json"
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "tititanpro_admin_2026")
+app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "cambia-esto-en-render")
+database_url = os.getenv("DATABASE_URL", "sqlite:///licenses.db")
 
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-STRIPE_PRICE_MONTHLY = os.getenv("STRIPE_PRICE_MONTHLY", "")
-STRIPE_PRICE_LIFETIME = os.getenv("STRIPE_PRICE_LIFETIME", "")
-BASE_URL = os.getenv("BASE_URL", "https://ttitanpro-server-1.onrender.com")
+# Compatibilidad por si luego usas postgres en Render
+if database_url.startswith("postgres://"):
+    database_url = database_url.replace("postgres://", "postgresql://", 1)
 
-stripe.api_key = STRIPE_SECRET_KEY
+app.config["SQLALCHEMY_DATABASE_URI"] = database_url
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
+db = SQLAlchemy(app)
 
-# =========================
-# HELPERS
-# =========================
-def now_utc():
-    return datetime.now(timezone.utc)
-
-
-def load_licenses():
-    if not os.path.exists(LICENSE_FILE):
-        return {}
-    try:
-        with open(LICENSE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_licenses(data):
-    with open(LICENSE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-
-def generate_license_key(plan="lifetime"):
-    suffix = "L" if plan == "lifetime" else "M"
-    return f"TITANPRO-{str(uuid.uuid4())[:8].upper()}-{suffix}"
-
-
-def find_license_by_email(email):
-    email = (email or "").strip().lower()
-    licenses = load_licenses()
-    for key, lic in licenses.items():
-        if (lic.get("email") or "").strip().lower() == email and lic.get("status") == "active":
-            return key, lic
-    return None, None
-
-
-def upsert_license_for_email(email, plan):
-    email = (email or "").strip().lower()
-    licenses = load_licenses()
-
-    existing_key = None
-    for key, lic in licenses.items():
-        if (lic.get("email") or "").strip().lower() == email:
-            existing_key = key
-            break
-
-    expires_at = None
-    if plan == "monthly":
-        expires_at = (now_utc() + timedelta(days=30)).isoformat()
-
-    if existing_key:
-        licenses[existing_key]["email"] = email
-        licenses[existing_key]["plan"] = plan
-        licenses[existing_key]["status"] = "active"
-        licenses[existing_key]["updated_at"] = now_utc().isoformat()
-        licenses[existing_key]["expires_at"] = expires_at
-        save_licenses(licenses)
-        return existing_key, licenses[existing_key]
-
-    license_key = generate_license_key(plan)
-    licenses[license_key] = {
-        "email": email,
-        "plan": plan,
-        "status": "active",
-        "created_at": now_utc().isoformat(),
-        "updated_at": now_utc().isoformat(),
-        "expires_at": expires_at
-    }
-    save_licenses(licenses)
-    return license_key, licenses[license_key]
-
-
-def revoke_license_by_email(email):
-    email = (email or "").strip().lower()
-    licenses = load_licenses()
-    changed = False
-
-    for key, lic in licenses.items():
-        if (lic.get("email") or "").strip().lower() == email:
-            lic["status"] = "revoked"
-            lic["updated_at"] = now_utc().isoformat()
-            changed = True
-
-    if changed:
-        save_licenses(licenses)
-    return changed
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
 
 # =========================
-# WEB
+# MODELO DE LICENCIA
+# =========================
+class License(db.Model):
+    __tablename__ = "licenses"
+
+    id = db.Column(db.Integer, primary_key=True)
+    license_key = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    customer_name = db.Column(db.String(120), nullable=True)
+    customer_email = db.Column(db.String(120), nullable=True)
+    active = db.Column(db.Boolean, default=True, nullable=False)
+    machine_id = db.Column(db.String(255), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = db.Column(db.DateTime, nullable=True)
+    notes = db.Column(db.Text, nullable=True)
+
+    def is_expired(self) -> bool:
+        return self.expires_at is not None and datetime.utcnow() > self.expires_at
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "license_key": self.license_key,
+            "customer_name": self.customer_name,
+            "customer_email": self.customer_email,
+            "active": self.active,
+            "machine_id": self.machine_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "expired": self.is_expired(),
+            "notes": self.notes,
+        }
+
+
+with app.app_context():
+    db.create_all()
+
+
+# =========================
+# FUNCIONES AUXILIARES
+# =========================
+def generate_license_key(prefix: str = "TITAN") -> str:
+    """
+    Genera una licencia tipo:
+    TITAN-AB12CD-34EFGH-7890JK
+    """
+    parts = [
+        secrets.token_hex(3).upper(),
+        secrets.token_hex(3).upper(),
+        secrets.token_hex(3).upper(),
+    ]
+    return f"{prefix}-" + "-".join(parts)
+
+
+def admin_ok() -> bool:
+    return request.args.get("password") == ADMIN_PASSWORD or request.form.get("password") == ADMIN_PASSWORD
+
+
+def require_admin():
+    if not admin_ok():
+        return (
+            "<h2>Acceso denegado</h2><p>Password admin incorrecta o faltante.</p>",
+            401,
+        )
+    return None
+
+
+# =========================
+# HTML SIMPLE DEL PANEL
+# =========================
+ADMIN_TEMPLATE = """
+<!doctype html>
+<html lang="es">
+<head>
+    <meta charset="utf-8">
+    <title>Panel Admin - Titan Pro Licenses</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #0f1115;
+            color: #f5f5f5;
+            margin: 0;
+            padding: 20px;
+        }
+        .wrap {
+            max-width: 1100px;
+            margin: auto;
+        }
+        .card {
+            background: #181c23;
+            border: 1px solid #2a2f3a;
+            border-radius: 14px;
+            padding: 18px;
+            margin-bottom: 20px;
+        }
+        h1, h2 {
+            margin-top: 0;
+        }
+        input, textarea, select {
+            width: 100%;
+            padding: 10px;
+            border-radius: 8px;
+            border: 1px solid #3a4250;
+            background: #0f1115;
+            color: #fff;
+            margin-top: 6px;
+            margin-bottom: 12px;
+        }
+        button, .btn {
+            background: #1f8f4e;
+            color: white;
+            border: none;
+            padding: 10px 14px;
+            border-radius: 8px;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            margin-right: 8px;
+            margin-bottom: 6px;
+        }
+        .btn.red {
+            background: #b63737;
+        }
+        .btn.gray {
+            background: #4b5563;
+        }
+        .btn.blue {
+            background: #2563eb;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 12px;
+            font-size: 14px;
+        }
+        th, td {
+            border-bottom: 1px solid #2a2f3a;
+            padding: 10px;
+            text-align: left;
+            vertical-align: top;
+        }
+        .status-on {
+            color: #4ade80;
+            font-weight: bold;
+        }
+        .status-off {
+            color: #f87171;
+            font-weight: bold;
+        }
+        .small {
+            color: #b7c0cf;
+            font-size: 13px;
+        }
+        code {
+            background: #0b0d11;
+            padding: 4px 6px;
+            border-radius: 6px;
+        }
+    </style>
+</head>
+<body>
+<div class="wrap">
+    <div class="card">
+        <h1>Panel Admin - Titan Pro Licenses</h1>
+        <p class="small">Servidor activo. Total licencias: <strong>{{ total }}</strong></p>
+        <p class="small">Para entrar aquí debes usar la URL con <code>?password=TU_PASSWORD</code></p>
+    </div>
+
+    <div class="card">
+        <h2>Crear nueva licencia</h2>
+        <form method="post" action="/create-license">
+            <input type="hidden" name="password" value="{{ password }}">
+            
+            <label>Prefijo</label>
+            <input type="text" name="prefix" value="TITAN">
+
+            <label>Nombre del cliente</label>
+            <input type="text" name="customer_name" placeholder="Ejemplo: Juan Perez">
+
+            <label>Email del cliente</label>
+            <input type="text" name="customer_email" placeholder="cliente@email.com">
+
+            <label>Días de duración (vacío = sin vencimiento)</label>
+            <input type="number" name="days_valid" placeholder="30">
+
+            <label>Notas</label>
+            <textarea name="notes" rows="3" placeholder="Notas internas"></textarea>
+
+            <button type="submit">Crear licencia</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h2>Licencias</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Licencia</th>
+                    <th>Cliente</th>
+                    <th>Email</th>
+                    <th>Estado</th>
+                    <th>Machine ID</th>
+                    <th>Creada</th>
+                    <th>Expira</th>
+                    <th>Acciones</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for lic in licenses %}
+                <tr>
+                    <td>{{ lic.id }}</td>
+                    <td><code>{{ lic.license_key }}</code></td>
+                    <td>{{ lic.customer_name or "" }}</td>
+                    <td>{{ lic.customer_email or "" }}</td>
+                    <td>
+                        {% if lic.active and not lic.is_expired() %}
+                            <span class="status-on">ACTIVA</span>
+                        {% elif lic.is_expired() %}
+                            <span class="status-off">VENCIDA</span>
+                        {% else %}
+                            <span class="status-off">DESACTIVADA</span>
+                        {% endif %}
+                    </td>
+                    <td>{{ lic.machine_id or "" }}</td>
+                    <td>{{ lic.created_at.strftime("%Y-%m-%d %H:%M") if lic.created_at else "" }}</td>
+                    <td>{{ lic.expires_at.strftime("%Y-%m-%d %H:%M") if lic.expires_at else "Sin vencimiento" }}</td>
+                    <td>
+                        <a class="btn blue" href="/toggle-license/{{ lic.id }}?password={{ password }}">Activar/Desactivar</a>
+                        <a class="btn gray" href="/clear-machine/{{ lic.id }}?password={{ password }}">Limpiar equipo</a>
+                        <a class="btn red" href="/delete-license/{{ lic.id }}?password={{ password }}" onclick="return confirm('¿Eliminar esta licencia?');">Eliminar</a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+</body>
+</html>
+"""
+
+
+# =========================
+# RUTAS PRINCIPALES
 # =========================
 @app.route("/")
 def home():
-    html = f"""
-    <html>
-    <head>
-        <title>TitanPro Licenses</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <style>
-            body {{
-                font-family: Arial, sans-serif;
-                background: #0f1115;
-                color: white;
-                margin: 0;
-                padding: 40px 20px;
-            }}
-            .wrap {{
-                max-width: 900px;
-                margin: 0 auto;
-            }}
-            .hero {{
-                text-align: center;
-                margin-bottom: 40px;
-            }}
-            .hero h1 {{
-                font-size: 42px;
-                margin-bottom: 10px;
-                color: #f5c542;
-            }}
-            .hero p {{
-                color: #c8c8c8;
-                font-size: 18px;
-            }}
-            .box {{
-                background: #171a21;
-                border: 1px solid #2a2f3a;
-                border-radius: 16px;
-                padding: 24px;
-                margin-bottom: 24px;
-            }}
-            input {{
-                width: 100%;
-                padding: 14px;
-                border-radius: 10px;
-                border: 1px solid #333;
-                background: #0f1115;
-                color: white;
-                margin-bottom: 20px;
-                font-size: 16px;
-            }}
-            .plans {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-                gap: 20px;
-            }}
-            .plan {{
-                background: #171a21;
-                border: 1px solid #2a2f3a;
-                border-radius: 16px;
-                padding: 24px;
-            }}
-            .plan h2 {{
-                margin-top: 0;
-                color: #f5c542;
-            }}
-            .price {{
-                font-size: 34px;
-                font-weight: bold;
-                margin: 12px 0 20px;
-            }}
-            button {{
-                width: 100%;
-                padding: 14px;
-                border: none;
-                border-radius: 10px;
-                font-size: 16px;
-                font-weight: bold;
-                cursor: pointer;
-            }}
-            .monthly {{
-                background: #1fb36a;
-                color: white;
-            }}
-            .lifetime {{
-                background: #f5c542;
-                color: black;
-            }}
-            .note {{
-                color: #b9b9b9;
-                font-size: 14px;
-                margin-top: 8px;
-            }}
-            .footer {{
-                margin-top: 28px;
-                color: #9d9d9d;
-                font-size: 14px;
-                text-align: center;
-            }}
-        </style>
-        <script>
-            async function buy(plan) {{
-                const email = document.getElementById("email").value.trim();
-                if (!email) {{
-                    alert("Escribe tu correo primero.");
-                    return;
-                }}
-
-                const res = await fetch("/create-checkout-session", {{
-                    method: "POST",
-                    headers: {{
-                        "Content-Type": "application/json"
-                    }},
-                    body: JSON.stringify({{ email, plan }})
-                }});
-
-                const data = await res.json();
-
-                if (!res.ok) {{
-                    alert(data.error || "Error creando checkout.");
-                    return;
-                }}
-
-                window.location.href = data.url;
-            }}
-        </script>
-    </head>
-    <body>
-        <div class="wrap">
-            <div class="hero">
-                <h1>TitanPro</h1>
-                <p>Compra automática de licencias para tu bot.</p>
-            </div>
-
-            <div class="box">
-                <label for="email">Correo del cliente</label>
-                <input id="email" type="email" placeholder="cliente@gmail.com" />
-                <div class="note">La licencia quedará asociada a ese correo.</div>
-            </div>
-
-            <div class="plans">
-                <div class="plan">
-                    <h2>Mensual</h2>
-                    <div class="price">$299</div>
-                    <button class="monthly" onclick="buy('monthly')">Comprar mensual</button>
-                </div>
-
-                <div class="plan">
-                    <h2>De por vida</h2>
-                    <div class="price">$899</div>
-                    <button class="lifetime" onclick="buy('lifetime')">Comprar lifetime</button>
-                </div>
-            </div>
-
-            <div class="footer">
-                El acceso se activa automáticamente después del pago.
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    return Response(html, mimetype="text/html")
-
-
-@app.route("/success")
-def success():
-    return """
-    <h2>Pago completado ✅</h2>
-    <p>Tu licencia se está procesando automáticamente.</p>
-    <p>Revisa tu correo o contáctame si no la ves reflejada todavía.</p>
-    """
-
-
-@app.route("/cancel")
-def cancel():
-    return """
-    <h2>Pago cancelado</h2>
-    <p>No se completó la compra.</p>
-    """
+    return jsonify({
+        "ok": True,
+        "message": "Titan Pro License Server funcionando",
+        "time_utc": datetime.utcnow().isoformat()
+    })
 
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True})
+    return jsonify({"status": "healthy"})
+
+
+@app.route("/admin")
+def admin_panel():
+    denied = require_admin()
+    if denied:
+        return denied
+
+    licenses = License.query.order_by(License.id.desc()).all()
+    return render_template_string(
+        ADMIN_TEMPLATE,
+        licenses=licenses,
+        total=len(licenses),
+        password=request.args.get("password", "")
+    )
+
+
+@app.route("/licenses")
+def list_licenses():
+    denied = require_admin()
+    if denied:
+        return denied
+
+    licenses = License.query.order_by(License.id.desc()).all()
+    return jsonify([lic.to_dict() for lic in licenses])
+
+
+@app.route("/create-license", methods=["POST"])
+def create_license():
+    denied = require_admin()
+    if denied:
+        return denied
+
+    prefix = (request.form.get("prefix") or "TITAN").strip().upper()
+    customer_name = (request.form.get("customer_name") or "").strip()
+    customer_email = (request.form.get("customer_email") or "").strip()
+    notes = (request.form.get("notes") or "").strip()
+    days_valid = (request.form.get("days_valid") or "").strip()
+
+    license_key = generate_license_key(prefix=prefix)
+
+    expires_at = None
+    if days_valid:
+        try:
+            days = int(days_valid)
+            if days > 0:
+                expires_at = datetime.utcnow() + timedelta(days=days)
+        except ValueError:
+            pass
+
+    lic = License(
+        license_key=license_key,
+        customer_name=customer_name,
+        customer_email=customer_email,
+        active=True,
+        expires_at=expires_at,
+        notes=notes
+    )
+
+    db.session.add(lic)
+    db.session.commit()
+
+    return redirect(url_for("admin_panel", password=request.form.get("password")))
+
+
+@app.route("/toggle-license/<int:license_id>")
+def toggle_license(license_id):
+    denied = require_admin()
+    if denied:
+        return denied
+
+    lic = License.query.get_or_404(license_id)
+    lic.active = not lic.active
+    db.session.commit()
+
+    return redirect(url_for("admin_panel", password=request.args.get("password")))
+
+
+@app.route("/clear-machine/<int:license_id>")
+def clear_machine(license_id):
+    denied = require_admin()
+    if denied:
+        return denied
+
+    lic = License.query.get_or_404(license_id)
+    lic.machine_id = None
+    db.session.commit()
+
+    return redirect(url_for("admin_panel", password=request.args.get("password")))
+
+
+@app.route("/delete-license/<int:license_id>")
+def delete_license(license_id):
+    denied = require_admin()
+    if denied:
+        return denied
+
+    lic = License.query.get_or_404(license_id)
+    db.session.delete(lic)
+    db.session.commit()
+
+    return redirect(url_for("admin_panel", password=request.args.get("password")))
 
 
 # =========================
-# STRIPE CHECKOUT
+# VALIDACION PARA EL BOT
 # =========================
-@app.route("/create-checkout-session", methods=["POST"])
-def create_checkout_session():
-    if not STRIPE_SECRET_KEY:
-        return jsonify({"error": "Falta STRIPE_SECRET_KEY"}), 500
-
-    data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
-    plan = (data.get("plan") or "").strip().lower()
-
-    if not email:
-        return jsonify({"error": "email requerido"}), 400
-
-    if plan not in ["monthly", "lifetime"]:
-        return jsonify({"error": "plan inválido"}), 400
-
-    try:
-        if plan == "monthly":
-            if not STRIPE_PRICE_MONTHLY:
-                return jsonify({"error": "Falta STRIPE_PRICE_MONTHLY"}), 500
-
-            session = stripe.checkout.Session.create(
-                mode="subscription",
-                customer_email=email,
-                line_items=[{"price": STRIPE_PRICE_MONTHLY, "quantity": 1}],
-                success_url=f"{BASE_URL}/success",
-                cancel_url=f"{BASE_URL}/cancel",
-                metadata={
-                    "email": email,
-                    "plan": "monthly"
-                }
-            )
-        else:
-            if not STRIPE_PRICE_LIFETIME:
-                return jsonify({"error": "Falta STRIPE_PRICE_LIFETIME"}), 500
-
-            session = stripe.checkout.Session.create(
-                mode="payment",
-                customer_email=email,
-                line_items=[{"price": STRIPE_PRICE_LIFETIME, "quantity": 1}],
-                success_url=f"{BASE_URL}/success",
-                cancel_url=f"{BASE_URL}/cancel",
-                metadata={
-                    "email": email,
-                    "plan": "lifetime"
-                }
-            )
-
-        return jsonify({"url": session.url})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# =========================
-# STRIPE WEBHOOK
-# =========================
-@app.route("/stripe/webhook", methods=["POST"])
-def stripe_webhook():
-    payload = request.data
-    sig_header = request.headers.get("Stripe-Signature", "")
-
-    if not STRIPE_WEBHOOK_SECRET:
-        return jsonify({"error": "Falta STRIPE_WEBHOOK_SECRET"}), 500
-
-    try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, STRIPE_WEBHOOK_SECRET
-        )
-    except ValueError:
-        return jsonify({"error": "Payload inválido"}), 400
-    except stripe.error.SignatureVerificationError:
-        return jsonify({"error": "Firma inválida"}), 400
-
-    event_type = event["type"]
-    obj = event["data"]["object"]
-
-    try:
-        if event_type == "checkout.session.completed":
-            email = None
-            plan = None
-
-            metadata = obj.get("metadata", {}) or {}
-            email = (metadata.get("email") or obj.get("customer_details", {}).get("email") or "").strip().lower()
-            plan = (metadata.get("plan") or "").strip().lower()
-
-            if email and plan in ["monthly", "lifetime"]:
-                upsert_license_for_email(email, plan)
-
-        elif event_type == "invoice.paid":
-            customer_email = ""
-            subscription = obj.get("subscription")
-
-            if subscription:
-                # Renovación de mensual
-                customer_email = (obj.get("customer_email") or "").strip().lower()
-                if customer_email:
-                    upsert_license_for_email(customer_email, "monthly")
-
-        elif event_type in ["customer.subscription.deleted", "customer.subscription.updated"]:
-            status = obj.get("status", "")
-            customer_id = obj.get("customer", "")
-
-            # Buscar email del customer si se canceló o quedó incompleto
-            if status in ["canceled", "unpaid", "incomplete_expired"]:
-                customer = stripe.Customer.retrieve(customer_id)
-                email = (customer.get("email") or "").strip().lower()
-                if email:
-                    revoke_license_by_email(email)
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-    return jsonify({"received": True})
-
-
-# =========================
-# ADMIN
-# =========================
-@app.route("/admin/create-license", methods=["POST"])
-def admin_create_license():
-    token = request.headers.get("X-Admin-Token", "")
-    if token != ADMIN_TOKEN:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
-    plan = (data.get("plan") or "lifetime").strip().lower()
-
-    if not email:
-        return jsonify({"error": "email requerido"}), 400
-
-    if plan not in ["lifetime", "monthly"]:
-        return jsonify({"error": "plan inválido"}), 400
-
-    key, lic = upsert_license_for_email(email, plan)
-
-    return jsonify({
-        "ok": True,
-        "license_key": key,
-        "email": email,
-        "plan": plan,
-        "expires_at": lic.get("expires_at")
-    })
-
-
-@app.route("/admin/revoke-license", methods=["POST"])
-def admin_revoke_license():
-    token = request.headers.get("X-Admin-Token", "")
-    if token != ADMIN_TOKEN:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    data = request.get_json(silent=True) or {}
-    license_key = (data.get("license_key") or "").strip()
-
-    if not license_key:
-        return jsonify({"error": "license_key requerido"}), 400
-
-    licenses = load_licenses()
-    if license_key not in licenses:
-        return jsonify({"error": "licencia no encontrada"}), 404
-
-    licenses[license_key]["status"] = "revoked"
-    licenses[license_key]["updated_at"] = now_utc().isoformat()
-    save_licenses(licenses)
-
-    return jsonify({"ok": True, "license_key": license_key, "status": "revoked"})
-
-
-# =========================
-# BOT VALIDATION
-# =========================
-@app.route("/api/validate")
+@app.route("/validate", methods=["GET", "POST"])
 def validate_license():
-    license_key = (request.args.get("key") or "").strip()
+    """
+    Tu bot puede enviar:
+    - key: licencia
+    - machine_id: id unico de la PC (opcional al principio, recomendado)
+    
+    Respuesta:
+    {
+      "status": "valid" / "invalid",
+      "message": "...",
+      ...
+    }
+    """
+    license_key = (request.values.get("key") or "").strip().upper()
+    machine_id = (request.values.get("machine_id") or "").strip()
 
     if not license_key:
         return jsonify({
-            "valid": False,
-            "status": "missing_key",
-            "message": "Falta license key"
+            "status": "invalid",
+            "message": "Falta la licencia"
         }), 400
 
-    licenses = load_licenses()
-    lic = licenses.get(license_key)
+    lic = License.query.filter_by(license_key=license_key).first()
 
     if not lic:
         return jsonify({
-            "valid": False,
-            "status": "not_found",
+            "status": "invalid",
             "message": "Licencia no encontrada"
-        })
+        }), 404
 
-    if lic.get("status") != "active":
+    if not lic.active:
         return jsonify({
-            "valid": False,
-            "status": lic.get("status"),
-            "message": "Licencia inactiva"
-        })
+            "status": "invalid",
+            "message": "Licencia desactivada"
+        }), 403
 
-    if lic.get("plan") == "monthly":
-        expires_at = lic.get("expires_at")
-        if not expires_at:
+    if lic.is_expired():
+        return jsonify({
+            "status": "invalid",
+            "message": "Licencia vencida"
+        }), 403
+
+    # Bloqueo opcional por equipo:
+    # - Si la licencia no tiene machine_id guardado, guarda el primero que llegue
+    # - Si ya tiene uno, solo valida si coincide
+    if machine_id:
+        if lic.machine_id is None:
+            lic.machine_id = machine_id
+            db.session.commit()
+        elif lic.machine_id != machine_id:
             return jsonify({
-                "valid": False,
-                "status": "misconfigured",
-                "message": "Licencia mensual mal configurada"
-            })
-
-        try:
-            expires_dt = datetime.fromisoformat(expires_at)
-            if now_utc() > expires_dt:
-                lic["status"] = "expired"
-                lic["updated_at"] = now_utc().isoformat()
-                licenses[license_key] = lic
-                save_licenses(licenses)
-
-                return jsonify({
-                    "valid": False,
-                    "status": "expired",
-                    "message": "Licencia expirada"
-                })
-        except Exception:
-            return jsonify({
-                "valid": False,
-                "status": "error",
-                "message": "Error leyendo expiración"
-            })
+                "status": "invalid",
+                "message": "Licencia usada en otro equipo"
+            }), 403
 
     return jsonify({
-        "valid": True,
-        "status": "active",
-        "plan": lic.get("plan"),
-        "email": lic.get("email"),
-        "expires_at": lic.get("expires_at")
+        "status": "valid",
+        "message": "Licencia válida",
+        "license_key": lic.license_key,
+        "customer_name": lic.customer_name,
+        "expires_at": lic.expires_at.isoformat() if lic.expires_at else None
     })
 
 
+# =========================
+# CREAR LICENCIA POR API
+# =========================
+@app.route("/api/create-license", methods=["POST"])
+def api_create_license():
+    """
+    Esta ruta es opcional.
+    Sirve si luego quieres crear licencias desde otra app.
+    Debes enviar admin_password.
+    """
+    admin_password = request.values.get("admin_password", "")
+    if admin_password != ADMIN_PASSWORD:
+        return jsonify({"ok": False, "message": "No autorizado"}), 401
+
+    prefix = (request.values.get("prefix") or "TITAN").strip().upper()
+    customer_name = (request.values.get("customer_name") or "").strip()
+    customer_email = (request.values.get("customer_email") or "").strip()
+    notes = (request.values.get("notes") or "").strip()
+    days_valid = (request.values.get("days_valid") or "").strip()
+
+    license_key = generate_license_key(prefix=prefix)
+
+    expires_at = None
+    if days_valid:
+        try:
+            days = int(days_valid)
+            if days > 0:
+                expires_at = datetime.utcnow() + timedelta(days=days)
+        except ValueError:
+            return jsonify({"ok": False, "message": "days_valid inválido"}), 400
+
+    lic = License(
+        license_key=license_key,
+        customer_name=customer_name,
+        customer_email=customer_email,
+        active=True,
+        expires_at=expires_at,
+        notes=notes
+    )
+    db.session.add(lic)
+    db.session.commit()
+
+    return jsonify({
+        "ok": True,
+        "message": "Licencia creada",
+        "license": lic.to_dict()
+    })
+
+
+# =========================
+# INICIO
+# =========================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
